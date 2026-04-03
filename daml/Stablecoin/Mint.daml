@@ -1,0 +1,102 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Stablecoin.Mint where
+
+import DA.Set (empty)
+import Stablecoin.Token (Token)
+
+-- | Represents a formal request from a 'tokenHolder' to the 'issuer' to mint a
+-- | specified 'amount' of stablecoins of a given 'tokenType'.
+-- | This request must be attested by a neutral 'auditor' who verifies the
+-- | backing reserves before the minting can proceed.
+template MintRequest
+  with
+    issuer : Party
+      -- ^ The entity responsible for issuing the stablecoin.
+    tokenHolder : Party
+      -- ^ The party requesting to receive the newly minted tokens.
+    auditor : Party
+      -- ^ An independent party responsible for verifying the reserves.
+    tokenType : Text
+      -- ^ The type of stablecoin to be minted (e.g., "EURC", "GBPC").
+    amount : Decimal
+      -- ^ The quantity of tokens to mint.
+    requestId : Text
+      -- ^ A unique identifier for the minting request for tracking and idempotency.
+  where
+    ensure amount > 0.0
+
+    signatory issuer, tokenHolder
+    observer auditor
+
+    key (issuer, tokenHolder, requestId) : (Party, Party, Text)
+    maintainer key._1
+
+    -- | The 'tokenHolder' can withdraw their mint request at any time before it has
+    -- | been attested by the auditor.
+    choice CancelMintRequest : ()
+      controller tokenHolder
+      do
+        archive self
+
+    -- | The 'auditor' exercises this choice to confirm that the corresponding fiat
+    -- | or commodity reserves have been received and are sufficient to back the
+    -- | requested mint amount.
+    choice AttestReserves : ContractId AttestedMintRequest
+      with
+        attestationProof : Text
+          -- ^ A reference to the proof of reserve (e.g., a bank transaction ID).
+      controller auditor
+      do
+        create AttestedMintRequest with
+          issuer
+          tokenHolder
+          auditor
+          tokenType
+          amount
+          requestId
+          attestationProof
+
+-- | Represents a 'MintRequest' that has been successfully verified by the 'auditor'.
+-- | This contract serves as the authorization for the 'issuer' to proceed with
+-- | the final minting of the tokens.
+template AttestedMintRequest
+  with
+    issuer : Party
+      -- ^ The stablecoin issuer.
+    tokenHolder : Party
+      -- ^ The party who will receive the minted tokens.
+    auditor : Party
+      -- ^ The auditor who verified the reserves.
+    tokenType : Text
+      -- ^ The type of stablecoin.
+    amount : Decimal
+      -- ^ The quantity of tokens.
+    requestId : Text
+      -- ^ The original unique identifier for the request.
+    attestationProof : Text
+      -- ^ The proof of reserve provided by the auditor.
+  where
+    signatory issuer
+    observer tokenHolder, auditor
+
+    key (issuer, tokenHolder, requestId) : (Party, Party, Text)
+    maintainer key._1
+
+    -- | The 'issuer' exercises this choice to create the stablecoin tokens and
+    -- | transfer them to the 'tokenHolder'. This is the final step in the
+    -- | minting workflow.
+    choice FinalizeMint : ContractId Token
+      controller issuer
+      do
+        -- In a production system with high volume, one might fetch an existing
+        -- Token holding for the owner and credit it. For this reference
+        -- framework, creating a new, distinct Token contract is a clear and
+        -- robust pattern that simplifies fungibility management.
+        create Token with
+          issuer = issuer
+          owner = tokenHolder
+          tokenType = tokenType
+          quantity = amount
+          observers = empty
