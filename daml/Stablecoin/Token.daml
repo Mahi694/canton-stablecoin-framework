@@ -1,0 +1,192 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Stablecoin.Token where
+
+import DA.Set (Set)
+import qualified DA.Set as Set
+import DA.Text (Text)
+import DA.Action (forA_, mapA)
+
+-- =================================================================================================
+-- Token Supply Contract
+--
+-- This contract tracks the total supply of a specific stablecoin variety (e.g., "EUR" from "IssuerX").
+-- It serves as the authoritative source for the total amount of a given token in circulation.
+--
+-- The issuer is the sole controller of this contract and can:
+--  - Mint new tokens, which increases the total supply and creates a `Token` holding for an owner.
+--  - Burn tokens, which decreases the total supply and archives a `Token` holding.
+-- =================================================================================================
+
+template TokenSupply
+  with
+    issuer      : Party
+    currency    : Text
+    description : Text
+    totalSupply : Decimal
+    observers   : Set Party
+  where
+    signatory issuer
+    observer observers
+
+    key (issuer, currency) : (Party, Text)
+    maintainer key._1
+
+    -- Mint new tokens, increasing the total supply.
+    -- The newly minted tokens are created in a new `Token` contract for the specified owner.
+    -- This choice is controlled exclusively by the issuer.
+    choice Mint : ContractId Token
+      with
+        owner    : Party    -- The party who will own the newly minted tokens.
+        quantity : Decimal  -- The amount of tokens to mint.
+      controller issuer
+      do
+        assertMsg "Mint quantity must be positive" $ quantity > 0.0
+
+        -- Update the total supply by recreating this contract with the new total.
+        create this with totalSupply = self.totalSupply + quantity
+        archive self
+
+        -- Create the new token holding for the owner.
+        -- Note: The new owner must also be a signatory on the Token contract,
+        -- so they must be a stakeholder in the transaction that exercises Mint.
+        create Token with
+          issuer      = issuer
+          owner       = owner
+          currency    = currency
+          description = description
+          quantity    = quantity
+          observers   = observers
+
+    -- Burn tokens, decreasing the total supply.
+    -- To burn tokens, an owner must first transfer their `Token` contract to the issuer.
+    -- The issuer then exercises this choice on their own token contract to destroy it
+    -- and update the total supply. This two-step process ensures only the issuer
+    -- can burn tokens, and only after re-acquiring them.
+    choice Burn : ()
+      with
+        tokenToBurnCid : ContractId Token -- The specific token contract to burn.
+      controller issuer
+      do
+        tokenToBurn <- fetch tokenToBurnCid
+        -- Ensure the token being burned belongs to the issuer.
+        assertMsg "Token to be burned must be owned by the issuer" $ tokenToBurn.owner == issuer
+        -- Ensure the token matches the supply contract's details.
+        assertMsg "Token currency must match supply currency" $ tokenToBurn.currency == currency
+        assertMsg "Token issuer must match supply issuer" $ tokenToBurn.issuer == issuer
+
+        let burnQuantity = tokenToBurn.quantity
+        assertMsg "Cannot burn more than the total supply" $ burnQuantity <= self.totalSupply
+
+        -- Burn the token contract.
+        archive tokenToBurnCid
+
+        -- Update the total supply by recreating this contract.
+        create this with totalSupply = self.totalSupply - burnQuantity
+        archive self
+
+-- =================================================================================================
+-- Token Holding Contract
+--
+-- This contract represents a specific quantity of a stablecoin held by an owner.
+-- It is fungible, meaning any `Token` of the same issuer and currency is interchangeable.
+-- The contract key ensures that an owner has at most one `Token` contract for each
+-- specific stablecoin, simplifying wallet management.
+-- =================================================================================================
+
+template Token
+  with
+    issuer      : Party
+    owner       : Party
+    currency    : Text
+    description : Text
+    quantity    : Decimal
+    observers   : Set Party
+  where
+    signatory issuer, owner
+    observer observers
+
+    ensure quantity > 0.0
+
+    key (issuer, owner, currency) : (Party, Party, Text)
+    maintainer key._1
+
+    -- Split a token holding into two smaller amounts.
+    -- This is a fundamental operation for making partial transfers.
+    -- The original contract is archived and replaced by two new ones.
+    choice Split : (ContractId Token, ContractId Token)
+      with
+        splitQuantity : Decimal
+      controller owner
+      do
+        assertMsg "Split quantity must be positive" $ splitQuantity > 0.0
+        assertMsg "Split quantity must be less than the total quantity" $ splitQuantity < self.quantity
+
+        let remainingQuantity = self.quantity - splitQuantity
+
+        -- Create the new contract for the split-off amount.
+        splitCid <- create this with quantity = splitQuantity
+
+        -- Create the new contract for the remaining amount.
+        remainingCid <- create this with quantity = remainingQuantity
+
+        archive self
+
+        return (splitCid, remainingCid)
+
+    -- Merge this token holding with one or more others.
+    -- All holdings must be of the same asset type (issuer, currency) and owned by the same party.
+    -- All original contracts are archived and replaced by a single, consolidated contract.
+    choice Merge : ContractId Token
+      with
+        otherTokenCids : [ContractId Token]
+      controller owner
+      do
+        assertMsg "Must provide at least one other token contract to merge" $ not $ null otherTokenCids
+
+        otherTokens <- mapA fetch otherTokenCids
+        forA_ otherTokens \otherToken -> do
+          assertMsg "All tokens must have the same owner to be merged" $ otherToken.owner == self.owner
+          assertMsg "All tokens must have the same issuer to be merged" $ otherToken.issuer == self.issuer
+          assertMsg "All tokens must have the same currency to be merged" $ otherToken.currency == self.currency
+
+        let totalQuantity = self.quantity + sum (map (\t -> t.quantity) otherTokens)
+
+        forA_ otherTokenCids archive
+        archive self
+
+        create this with quantity = totalQuantity
+
+    -- Transfer a portion or all of this token holding to a new owner.
+    -- This choice requires the `newOwner` as a controller, implying prior off-ledger
+    -- agreement or a preceding on-ledger proposal. This simplified transfer is a common
+    -- pattern for building more complex workflows.
+    -- The original contract is archived and replaced by one or two new contracts.
+    choice Transfer : ContractId Token
+      with
+        newOwner       : Party
+        transferQuantity : Decimal
+      controller owner, newOwner
+      do
+        assertMsg "Transfer quantity must be positive" $ transferQuantity > 0.0
+        assertMsg "Transfer quantity cannot exceed the token quantity" $ transferQuantity <= self.quantity
+
+        if transferQuantity == self.quantity then do
+          -- Full transfer: archive the old contract and create a new one for the new owner.
+          archive self
+          create this with owner = newOwner
+        else do
+          -- Partial transfer: archive the old contract and create two new ones.
+          let remainingQuantity = self.quantity - remainingQuantity
+
+          -- Create the remaining part for the original owner. Because of the contract key,
+          -- this will succeed as the original contract is archived within the same transaction.
+          create this with quantity = remainingQuantity
+
+          -- Create the transferred part for the new owner.
+          newOwnerCid <- create this with owner = newOwner, quantity = transferQuantity
+          
+          archive self
+
+          return newOwnerCid
