@@ -1,0 +1,128 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Stablecoin.Redeem where
+
+import DA.Time (Time, getTime)
+import DA.Text (Text)
+
+import Stablecoin.Token (Token)
+
+-- | A customer's request to redeem stablecoin tokens for the underlying asset.
+-- This contract serves as an authorization from the customer for the issuer to
+-- burn their tokens upon acceptance. The issuer must also be a signatory to
+-- agree to process the redemption.
+template RedemptionRequest
+  with
+    issuer : Party
+      -- ^ The stablecoin issuer responsible for redemption.
+    customer : Party
+      -- ^ The token holder requesting redemption.
+    tokenCid : ContractId Token
+      -- ^ The specific token contract to be redeemed from.
+    amountToRedeem : Decimal
+      -- ^ The amount of the token to redeem. Must be positive.
+    settlementDetails : Text
+      -- ^ Off-ledger settlement instructions (e.g., bank account details).
+    idempotencyKey : Text
+      -- ^ A unique key provided by the customer to prevent duplicate requests.
+  where
+    signatory customer, issuer
+
+    ensure amountToRedeem > 0.0
+
+    key (issuer, customer, idempotencyKey) : (Party, Party, Text)
+    maintainer key._1
+
+    -- | The issuer accepts the redemption request. This action burns the specified
+    -- | amount of tokens and creates a `RedemptionConfirmation`, representing the
+    -- | issuer's obligation to settle the redemption off-ledger.
+    choice AcceptRedemption : ContractId RedemptionConfirmation
+      controller issuer
+      do
+        -- Fetch the token contract to perform validations before proceeding.
+        token <- fetch tokenCid
+        assertMsg "Redemption amount cannot exceed token balance." (amountToRedeem <= token.quantity)
+        assertMsg "Token owner must match the customer requesting redemption." (token.owner == customer)
+        assertMsg "Token issuer must match the redemption processor." (token.issuer == issuer)
+
+        -- Burn the specified amount from the token contract.
+        -- This `exercise` is authorized by `customer` because `customer` is a
+        -- signatory on this `RedemptionRequest` contract. We assume the `Burn`
+        -- choice on the `Token` template is controlled by the token `owner`.
+        exercise tokenCid Token.Burn with amount = amountToRedeem
+
+        -- Create a confirmation contract for the off-ledger settlement obligation.
+        now <- getTime
+        create RedemptionConfirmation with
+          issuer
+          customer
+          redeemedAmount = amountToRedeem
+          asset = token.asset
+          settlementDetails
+          confirmationTimestamp = now
+
+    -- | The issuer rejects the redemption request. This archives the request and
+    -- | creates a `RedemptionRejected` notification for the customer, providing
+    -- | a reason for the rejection.
+    choice RejectRedemption : ContractId RedemptionRejected
+      with
+        reason : Text
+          -- ^ The reason for rejecting the request (e.g., compliance failure).
+      controller issuer
+      do
+        create RedemptionRejected with
+          issuer
+          customer
+          tokenCid
+          amountToRedeem
+          rejectionReason = reason
+
+-- | A notification that a `RedemptionRequest` has been rejected by the issuer.
+-- This contract serves as a record for the customer.
+template RedemptionRejected
+  with
+    issuer : Party
+    customer : Party
+    tokenCid : ContractId Token
+    amountToRedeem : Decimal
+    rejectionReason : Text
+  where
+    signatory issuer, customer
+
+    -- | The customer can archive this notification to clear it from their active view.
+    choice AcknowledgeRejection : ()
+      controller customer
+      do
+        archive self
+
+-- | A contract confirming that tokens have been successfully burned and an off-ledger
+-- | payment from the issuer to the customer is now due. This represents the issuer's
+-- | obligation to transfer the underlying reserve asset.
+template RedemptionConfirmation
+  with
+    issuer : Party
+      -- ^ The party obligated to make the off-ledger payment.
+    customer : Party
+      -- ^ The party who should receive the payment.
+    redeemedAmount : Decimal
+      -- ^ The amount of the asset redeemed.
+    asset : Text
+      -- ^ A description of the asset (e.g., "EUR Stablecoin").
+    settlementDetails : Text
+      -- ^ The settlement instructions for the off-ledger payment.
+    confirmationTimestamp : Time
+      -- ^ The timestamp when the redemption was confirmed and tokens were burned.
+  where
+    signatory issuer, customer
+
+    key (issuer, customer, confirmationTimestamp) : (Party, Party, Time)
+    maintainer key._1
+
+    -- | The customer acknowledges receipt of the off-ledger funds. This action
+    -- | completes the redemption workflow by archiving the confirmation, signifying
+    -- | that the issuer has fulfilled their obligation.
+    choice AcknowledgeSettlement : ()
+      controller customer
+      do
+        archive self
