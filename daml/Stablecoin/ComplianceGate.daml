@@ -1,0 +1,117 @@
+-- |
+-- Copyright (c) 2024, Digital Asset (Switzerland) GmbH and/or its affiliates.
+-- All rights reserved.
+--
+
+module Stablecoin.ComplianceGate where
+
+import Daml.Finance.Interface.Util.Common qualified as Common (stringToParty)
+import DA.Assert ((===))
+import DA.List (elem, filter)
+
+-- | Defines a compliance gate for a specific stablecoin, managed by an issuer
+-- and a designated compliance provider. The gate maintains an allowlist of parties
+-- who have passed KYC/AML checks and are permitted to receive tokens.
+template ComplianceGate
+  with
+    issuer : Party
+      -- ^ The issuer of the stablecoin this gate applies to.
+    complianceProvider : Party
+      -- ^ The party responsible for performing KYC/AML and managing the allowlist.
+    tokenName : Text
+      -- ^ The name of the stablecoin token (e.g., "EURC", "GBPC").
+    allowlist : [Party]
+      -- ^ The list of parties who are approved to hold and receive the token.
+  where
+    signatory issuer, complianceProvider
+
+    key (issuer, tokenName) : (Party, Text)
+    maintainer key._1
+
+    -- | Non-consuming choice to verify if a given party is on the allowlist.
+    -- This is intended to be called by other contracts (e.g., during a token transfer)
+    -- to enforce compliance rules before a transaction proceeds.
+    nonconsuming choice CheckTransfer
+      : ()
+      with
+        recipient : Party
+          -- ^ The party to check against the allowlist.
+      controller (signatories this) ++ allowlist
+      do
+        assertMsg (show recipient <> " is not on the allowlist for " <> tokenName) $
+          elem recipient allowlist
+
+    -- | A choice for the compliance provider to add a new party to the allowlist
+    -- after they have successfully passed KYC/AML checks.
+    choice AddToAllowlist
+      : ContractId ComplianceGate
+      with
+        partyToAdd : Party
+          -- ^ The party to add to the allowlist.
+      controller complianceProvider
+      do
+        assertMsg (show partyToAdd <> " is already on the allowlist.") $
+          not $ elem partyToAdd allowlist
+
+        create this with
+          allowlist = partyToAdd :: allowlist
+
+    -- | A choice for the compliance provider to remove a party from the allowlist,
+    -- for instance, if their KYC status expires or they are offboarded.
+    choice RemoveFromAllowlist
+      : ContractId ComplianceGate
+      with
+        partyToRemove : Party
+          -- ^ The party to remove from the allowlist.
+      controller complianceProvider
+      do
+        assertMsg (show partyToRemove <> " is not on the allowlist.") $
+          elem partyToRemove allowlist
+
+        create this with
+          allowlist = filter (/= partyToRemove) allowlist
+
+-- | Script to set up and test the ComplianceGate template.
+setup : Script ()
+setup = script do
+  -- Parties
+  issuer <- Common.stringToParty "Issuer"
+  complianceProvider <- Common.stringToParty "ComplianceProvider"
+  alice <- Common.stringToParty "Alice"
+  bob <- Common.stringToParty "Bob"
+
+  -- Create the compliance gate for "EURC"
+  gateCid <- submitMulti [issuer, complianceProvider] [] do
+    createCmd ComplianceGate with
+      issuer
+      complianceProvider
+      tokenName = "EURC"
+      allowlist = [issuer, complianceProvider] -- Initially, only issuer and provider are allowlisted
+
+  -- Test: Compliance provider adds Alice to the allowlist
+  gateCid' <- submit complianceProvider do
+    exerciseCmd gateCid AddToAllowlist with partyToAdd = alice
+
+  gate <- fetch gateCid'
+  gate.allowlist === [alice, issuer, complianceProvider]
+
+  -- Test: Issuer can check that Alice is on the allowlist (non-consuming)
+  submit issuer do
+    exerciseCmd gateCid' CheckTransfer with recipient = alice
+
+  -- Test: Bob is not on the allowlist, so the check should fail
+  submitMustFail issuer do
+    exerciseCmd gateCid' CheckTransfer with recipient = bob
+
+  -- Test: Compliance provider removes Alice
+  gateCid'' <- submit complianceProvider do
+    exerciseCmd gateCid' RemoveFromAllowlist with partyToRemove = alice
+
+  gate' <- fetch gateCid''
+  gate'.allowlist === [issuer, complianceProvider]
+
+  -- Test: Alice check should now fail
+  submitMustFail alice do
+    exerciseCmd gateCid'' CheckTransfer with recipient = alice
+
+  pure ()
