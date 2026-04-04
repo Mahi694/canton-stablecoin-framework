@@ -1,0 +1,145 @@
+-- |
+-- Copyright (c) 2024, Digital Asset (Switzerland) GmbH and/or its affiliates.
+-- All rights reserved.
+--
+
+module Stablecoin.ReserveAttestation where
+
+import DA.Date (Date)
+import DA.Time (Time)
+
+-- | Dummy role contract to represent an authorized issuer.
+-- In a real implementation, this would be in a separate Stablecoin.Role module.
+template IssuerRole
+  with
+    issuer : Party
+    operator : Party
+  where
+    signatory operator
+    observer issuer
+    key (issuer, operator) : (Party, Party)
+    maintainer key._2
+
+-- | Dummy role contract to represent an authorized custodian.
+-- In a real implementation, this would be in a separate Stablecoin.Role module.
+template CustodianRole
+  with
+    custodian : Party
+    operator : Party
+    issuer : Party -- The issuer this custodian is approved to work with
+  where
+    signatory operator
+    observer custodian, issuer
+    key (custodian, operator, issuer) : (Party, Party, Party)
+    maintainer key._2
+
+-- | Represents a formal declaration by a custodian about the reserves backing a stablecoin.
+-- This contract is the final, bilaterally signed attestation, visible to the public.
+template ReserveAttestation
+  with
+    custodian : Party
+      -- ^ The party attesting to the reserve balance (e.g., an audit firm, a bank).
+    issuer : Party
+      -- ^ The stablecoin issuer who acknowledges this attestation.
+    public : Party
+      -- ^ A party representing the public, who can observe this attestation for transparency.
+    assetId : Text
+      -- ^ The unique identifier for the stablecoin asset (e.g., "EURC", "GBPC").
+    attestationDate : Date
+      -- ^ The "as of" date for the reserve balance. Typically end-of-day.
+    attestationTimestamp : Time
+      -- ^ The exact timestamp when the attestation was generated.
+    reserveAmount : Decimal
+      -- ^ The total value of the reserves held.
+    reserveCurrency : Text
+      -- ^ The currency of the reserve (e.g., "USD", "EUR").
+    attestationReportUrl : Text
+      -- ^ A URL linking to the full, human-readable attestation report (e.g., a signed PDF).
+  where
+    signatory custodian, issuer
+    observer public
+
+    key (issuer, assetId, attestationDate) : (Party, Text, Date)
+    maintainer key._1
+
+    ensure
+      reserveAmount >= 0.0
+
+-- | A proposal from a custodian to an issuer to create a `ReserveAttestation`.
+-- This follows the standard proposal-acceptance pattern.
+template ReserveAttestationProposal
+  with
+    custodian : Party
+      -- ^ The party proposing the attestation.
+    issuer : Party
+      -- ^ The recipient of the proposal.
+    public : Party
+      -- ^ The public party who will observe the final attestation.
+    assetId : Text
+      -- ^ The identifier for the stablecoin asset.
+    attestationDate : Date
+      -- ^ The "as of" date for the reserve balance.
+    attestationTimestamp : Time
+      -- ^ The exact timestamp of the attestation.
+    reserveAmount : Decimal
+      -- ^ The total value of the reserves.
+    reserveCurrency : Text
+      -- ^ The currency of the reserve.
+    attestationReportUrl : Text
+      -- ^ URL to the full report.
+    custodianRoleCid : ContractId CustodianRole
+      -- ^ The custodian's authority to make this attestation.
+  where
+    signatory custodian
+    observer issuer
+
+    key (custodian, issuer, assetId, attestationDate) : (Party, Party, Text, Date)
+    maintainer key._1
+
+    ensure
+      reserveAmount >= 0.0
+
+    choice Accept : ContractId ReserveAttestation
+      -- ^ The issuer accepts the attestation proposal, creating the final `ReserveAttestation`.
+      with
+        issuerRoleCid : ContractId IssuerRole
+          -- ^ The issuer's authority contract.
+      controller issuer
+      do
+        -- Verify that the roles are valid for the parties involved.
+        custodianRole <- fetch custodianRoleCid
+        assertMsg "The custodian role is not valid for the proposing custodian."
+          (custodianRole.custodian == custodian)
+        assertMsg "The custodian role is not designated for this issuer."
+          (custodianRole.issuer == issuer)
+
+        issuerRole <- fetch issuerRoleCid
+        assertMsg "The issuer role is not valid for the accepting issuer."
+          (issuerRole.issuer == issuer)
+
+        -- Create the final, signed attestation contract.
+        create ReserveAttestation with
+          custodian
+          issuer
+          public
+          assetId
+          attestationDate
+          attestationTimestamp
+          reserveAmount
+          reserveCurrency
+          attestationReportUrl
+
+    choice Reject : ()
+      -- ^ The issuer rejects the attestation proposal.
+      with
+        reason : Text
+      controller issuer
+      do
+        -- No state change needed, just archive the proposal.
+        pure ()
+
+    choice Withdraw : ()
+      -- ^ The custodian withdraws their own proposal.
+      controller custodian
+      do
+        pure ()
