@@ -1,0 +1,264 @@
+-- |
+-- Copyright (c) 2024 Brale
+--
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- This module defines a yield-bearing stablecoin variant using a scalable,
+-- share-based model. Instead of directly updating the quantity of each token
+-- holder's contract, this model uses a central `YieldInstrument` contract to
+-- track an `exchangeRate`. Holders own "shares" in the form of a `YieldBearingToken`,
+-- and the value of their holding is calculated on-demand as `shareQuantity * exchangeRate`.
+-- This design is highly efficient as it avoids updating every holder's contract
+-- during yield accrual, requiring only a single update to the central instrument contract.
+
+module Stablecoin.YieldBearing where
+
+import Daml.Finance.Interface.Types.Common.Types (InstrumentKey)
+import DA.Time (Time, time, RelTime, seconds)
+import DA.Set (Set)
+import qualified DA.Set as Set
+import DA.Assert ((assert, assertMsg))
+
+-- The number of seconds in a year, accounting for leap years on average.
+secondsInYear : Decimal
+secondsInYear = 365.25 * 24.0 * 60.0 * 60.0
+
+-- | Defines the parameters of a yield-bearing instrument.
+-- This contract acts as the central source of truth for the instrument's
+-- current yield rate and its exchange rate against the underlying asset.
+template YieldInstrument
+  with
+    issuer: Party
+      -- ^ The party managing the instrument.
+    id: InstrumentKey
+      -- ^ The unique identifier for this instrument.
+    description: Text
+      -- ^ A description of the yield-bearing token.
+    apr: Decimal
+      -- ^ The current annual percentage rate (APR) for yield accrual.
+    exchangeRate: Decimal
+      -- ^ The rate at which one "share" of this instrument can be exchanged
+      -- for the underlying asset. This value increases over time. Starts at 1.0.
+    lastUpdateTimestamp: Time
+      -- ^ The timestamp of the last exchange rate update.
+    observers: Set Party
+      -- ^ Parties who can observe this instrument's state.
+  where
+    signatory issuer
+    observer observers
+
+    key (issuer, id) : (Party, InstrumentKey)
+    maintainer key._1
+
+    -- | Calculates the new exchange rate based on time passed and the current APR
+    -- using a simple interest model.
+    let calculateNewExchangeRate (currentTime: Time) : Decimal =
+          let
+            timeDeltaRel : RelTime = currentTime - lastUpdateTimestamp
+            timeDeltaSeconds : Int = seconds timeDeltaRel
+            timeDeltaYears : Decimal = intToDecimal timeDeltaSeconds / secondsInYear
+            yieldMultiplier = 1.0 + (apr * timeDeltaYears)
+          in
+            exchangeRate * yieldMultiplier
+
+    -- | Updates the annual percentage rate (APR). Before applying the new rate,
+    -- it accrues interest up to the current time using the old rate.
+    choice UpdateApr : ContractId YieldInstrument
+      with
+        newApr: Decimal
+          -- ^ The new annual percentage rate.
+        currentTime: Time
+          -- ^ The current time, to be provided by the transaction submitter.
+      controller issuer
+      do
+        assertMsg "New APR must be non-negative" (newApr >= 0.0)
+        assertMsg "Current time must be after last update" (currentTime > lastUpdateTimestamp)
+
+        let newExchangeRate = calculateNewExchangeRate currentTime
+
+        create this
+          with
+            apr = newApr
+            exchangeRate = newExchangeRate
+            lastUpdateTimestamp = currentTime
+
+    -- | Updates the instrument's exchange rate to a given point in time.
+    -- This is a deterministic calculation that can be triggered before a valuation
+    -- or redemption event.
+    choice UpdateExchangeRate : ContractId YieldInstrument
+      with
+        currentTime: Time
+          -- ^ The current time, to be provided by the transaction submitter.
+      controller issuer
+      do
+        assertMsg "Current time must be after last update" (currentTime >= lastUpdateTimestamp)
+
+        if currentTime == lastUpdateTimestamp then
+          return self
+        else
+          let
+            newExchangeRate = calculateNewExchangeRate currentTime
+          in create this
+            with
+              exchangeRate = newExchangeRate
+              lastUpdateTimestamp = currentTime
+
+-- | Represents a holding of a yield-bearing instrument.
+-- The actual value of this holding is determined by `shareQuantity * exchangeRate`
+-- from the corresponding `YieldInstrument` contract.
+template YieldBearingToken
+  with
+    owner: Party
+      -- ^ The owner of the token shares.
+    instrumentCid: ContractId YieldInstrument
+      -- ^ A reference to the instrument definition contract.
+    shareQuantity: Decimal
+      -- ^ The number of shares held by the owner.
+    observers: Set Party
+      -- ^ Parties who can observe this holding.
+  where
+    signatory owner
+    observer observers
+
+    ensure shareQuantity > 0.0
+
+    key (instrumentCid, owner) : (ContractId YieldInstrument, Party)
+    maintainer key._2
+
+    nonconsuming choice GetInstrumentData : YieldInstrument
+      controller owner, (Set.toList observers)
+      do
+        fetch instrumentCid
+
+    choice Split: (ContractId YieldBearingToken, ContractId YieldBearingToken)
+      with
+        splitQuantity: Decimal
+      controller owner
+      do
+        let remainingQuantity = shareQuantity - splitQuantity
+        assertMsg "Split quantity must be positive" (splitQuantity > 0.0)
+        assertMsg "Split quantity cannot exceed total quantity" (splitQuantity < shareQuantity)
+
+        token1Cid <- create this with shareQuantity = splitQuantity
+        token2Cid <- create this with shareQuantity = remainingQuantity
+        return (token1Cid, token2Cid)
+
+    choice Merge: ContractId YieldBearingToken
+      with
+        otherTokenCids: [ContractId YieldBearingToken]
+      controller owner
+      do
+        -- Fetch and validate all other tokens
+        otherTokens <- forA otherTokenCids fetch
+        forA_ otherTokens \otherToken -> do
+          assertMsg "Tokens must have the same owner" (otherToken.owner == owner)
+          assertMsg "Tokens must be for the same instrument" (otherToken.instrumentCid == instrumentCid)
+
+        -- Archive the other contracts
+        forA_ otherTokenCids archive
+
+        let totalOtherQuantity = sum (map (.shareQuantity) otherTokens)
+        create this with shareQuantity = shareQuantity + totalOtherQuantity
+
+    choice ProposeTransfer : ContractId YieldBearingTokenTransferProposal
+      with
+        newOwner: Party
+        quantityToTransfer: Decimal
+      controller owner
+      do
+        assertMsg "Transfer quantity must be positive" (quantityToTransfer > 0.0)
+        assertMsg "Transfer quantity cannot exceed total quantity" (quantityToTransfer <= shareQuantity)
+
+        create YieldBearingTokenTransferProposal
+          with
+            tokenCid = self
+            currentOwner = owner
+            newOwner
+            quantityToTransfer
+            observers
+
+    choice RequestRedemption : ContractId YieldBearingRedemptionRequest
+      with
+        currentTime: Time
+      controller owner
+      do
+        instrument <- fetch instrumentCid
+        updatedInstrumentCid <- exercise instrumentCid UpdateExchangeRate with currentTime
+        updatedInstrument <- fetch updatedInstrumentCid
+
+        let valueToRedeem = shareQuantity * updatedInstrument.exchangeRate
+
+        create YieldBearingRedemptionRequest
+          with
+            redeemer = owner
+            issuer = updatedInstrument.issuer
+            id = updatedInstrument.id
+            shareQuantity
+            redeemValue = valueToRedeem
+            timestamp = currentTime
+
+template YieldBearingTokenTransferProposal
+  with
+    tokenCid: ContractId YieldBearingToken
+    currentOwner: Party
+    newOwner: Party
+    quantityToTransfer: Decimal
+    observers: Set Party
+  where
+    signatory currentOwner, newOwner
+
+    choice AcceptTransfer : ContractId YieldBearingToken
+      controller newOwner
+      do
+        token <- fetch tokenCid
+        assertMsg "Proposal is for an outdated token contract" (tokenCid == self)
+        assertMsg "Proposal owner must match token owner" (token.owner == currentOwner)
+        assertMsg "Transfer quantity cannot exceed token quantity" (quantityToTransfer <= token.shareQuantity)
+
+        archive tokenCid
+
+        newOwnerTokenCid <- create YieldBearingToken
+          with
+            owner = newOwner
+            instrumentCid = token.instrumentCid
+            shareQuantity = quantityToTransfer
+            observers = token.observers
+
+        let remainingQuantity = token.shareQuantity - quantityToTransfer
+        if remainingQuantity > 0.0 then
+          create token with owner = currentOwner, shareQuantity = remainingQuantity
+        else
+          pure ()
+
+        return newOwnerTokenCid
+
+    choice CancelTransfer : ()
+      controller currentOwner
+      do
+        pure ()
+
+-- | A request to redeem a quantity of yield-bearing shares for the underlying asset.
+-- The issuer is responsible for fulfilling this request, which typically involves
+-- an off-ledger payment and subsequent archival of this contract.
+template YieldBearingRedemptionRequest
+  with
+    redeemer: Party
+      -- ^ The party requesting redemption.
+    issuer: Party
+      -- ^ The issuer who will fulfill the redemption.
+    id: InstrumentKey
+      -- ^ The instrument being redeemed.
+    shareQuantity: Decimal
+      -- ^ The number of shares to redeem.
+    redeemValue: Decimal
+      -- ^ The calculated value of the shares at the time of request, in the underlying asset.
+    timestamp: Time
+      -- ^ The time the request was made.
+  where
+    signatory redeemer, issuer
+
+    -- The issuer would have a choice here to `FulfillRedemption`, which would
+    -- trigger a payment workflow for the underlying asset and archive this request.
+    choice Acknowledge : ()
+      controller issuer
+      do pure()
