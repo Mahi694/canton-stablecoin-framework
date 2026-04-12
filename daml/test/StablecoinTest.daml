@@ -1,0 +1,207 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module StablecoinTest where
+
+import Daml.Script
+import DA.Assert
+import DA.Date as D
+import DA.Time
+import DA.Optional (fromSome)
+import qualified DA.Set as Set
+
+import Stablecoin.Mint
+import Stablecoin.Redeem
+import Stablecoin.ReserveAttestation
+import Stablecoin.ComplianceGate
+import Stablecoin.YieldBearing
+
+-- === Test Setup ===
+
+-- A helper record to hold the parties and contracts created during setup.
+data TestSetup = TestSetup
+  with
+    issuer: Party
+    user: Party
+    operator: Party
+    complianceOfficer: Party
+    attestor: Party
+    issuerRoleCid: ContractId IssuerRole
+    complianceRuleCid: ContractId Rule
+    yieldConfigCid: ContractId Configuration
+
+-- Centralized setup script for all tests.
+setup: Decimal -> Script TestSetup
+setup apr = do
+  issuer <- allocatePartyWithHint "Issuer" (PartyIdHint "issuer")
+  user <- allocatePartyWithHint "User" (PartyIdHint "user")
+  operator <- allocatePartyWithHint "Operator" (PartyIdHint "operator")
+  complianceOfficer <- allocatePartyWithHint "ComplianceOfficer" (PartyIdHint "compliance-officer")
+  attestor <- allocatePartyWithHint "Attestor" (PartyIdHint "attestor")
+
+  -- Create a compliance rule: allow mints up to 1,000,000.0
+  complianceRuleCid <- submit complianceOfficer do
+    createCmd Rule with
+      officer = complianceOfficer
+      maxMintAmount = 1_000_000.0
+      blockedParties = Set.empty
+
+  -- Create yield configuration
+  now <- getTime
+  yieldConfigCid <- submit operator do
+    createCmd Configuration with
+      issuer
+      operator
+      apr
+      lastAccrualTime = now
+
+  -- Create the central issuer role contract
+  issuerRoleCid <- submit issuer do
+    createCmd IssuerRole with
+      issuer
+      operator
+      observers = Set.empty
+      complianceRuleCid
+      yieldConfigCid
+
+  return TestSetup with ..
+
+-- === Test Scenarios ===
+
+-- Test a successful minting workflow.
+testMintSuccess : Script ()
+testMintSuccess = script do
+  debug "Running testMintSuccess..."
+  TestSetup{..} <- setup 0.0 -- 0% APR for this test
+
+  -- 1. User requests to mint 50,000 tokens
+  let mintAmount = 50_000.0
+  requestCid <- submit user do
+    exerciseCmd issuerRoleCid RequestMint with owner = user, amount = mintAmount
+
+  -- 2. Issuer approves the mint request
+  tokenCid <- submit issuer do
+    exerciseCmd requestCid ApproveMint
+
+  -- 3. Verify the token was created correctly
+  token <- fromSome <$> queryContractId user tokenCid
+  token.owner === user
+  token.issuer === issuer
+  token.amount === mintAmount
+  token.configCid === yieldConfigCid
+
+  debug "testMintSuccess finished successfully."
+
+-- Test a successful redemption workflow.
+testRedeemSuccess : Script ()
+testRedeemSuccess = script do
+  debug "Running testRedeemSuccess..."
+  TestSetup{..} <- setup 0.0
+
+  -- 1. Setup: Mint 10,000 tokens for the user first
+  let mintAmount = 10_000.0
+  requestCid <- submit user do
+    exerciseCmd issuerRoleCid RequestMint with owner = user, amount = mintAmount
+  tokenCid <- submit issuer do
+    exerciseCmd requestCid ApproveMint
+
+  -- 2. User requests to redeem the tokens
+  redeemRequestCid <- submit user do
+    exerciseCmd issuerRoleCid RequestRedemption with tokenCids = [tokenCid]
+
+  -- 3. Issuer approves the redemption
+  submit issuer do
+    exerciseCmd redeemRequestCid ApproveRedemption
+
+  -- 4. Verify the token contract has been archived
+  tokenAfterRedeem <- queryContractId user tokenCid
+  tokenAfterRedeem === None
+
+  debug "testRedeemSuccess finished successfully."
+
+-- Test that the compliance gate rejects a mint request that is too large.
+testComplianceGateFailure : Script ()
+testComplianceGateFailure = script do
+  debug "Running testComplianceGateFailure..."
+  TestSetup{..} <- setup 0.0
+
+  -- 1. Get the max mint amount from the rule
+  rule <- fromSome <$> queryContractId complianceOfficer complianceRuleCid
+  let oversizedAmount = rule.maxMintAmount + 1.0
+
+  -- 2. User attempts to mint an amount exceeding the compliance limit
+  -- This submission is expected to fail.
+  submitMustFail user do
+    exerciseCmd issuerRoleCid RequestMint with owner = user, amount = oversizedAmount
+
+  debug "testComplianceGateFailure finished successfully (as expected failure occurred)."
+
+-- Test the yield accrual functionality for yield-bearing tokens.
+testYieldAccrual : Script ()
+testYieldAccrual = script do
+  debug "Running testYieldAccrual..."
+  -- Setup with a 5% APR
+  let apr = 0.05
+  let initialAmount = 100_000.0
+  TestSetup{..} <- setup apr
+
+  -- 1. Setup: Mint initial tokens for the user
+  requestCid <- submit user do
+    exerciseCmd issuerRoleCid RequestMint with owner = user, amount = initialAmount
+  tokenCid <- submit issuer do
+    exerciseCmd requestCid ApproveMint
+
+  -- 2. Advance time by one full year (365 days)
+  let oneYear = days 365
+  passTime oneYear
+
+  -- 3. Operator triggers the yield accrual
+  updatedTokenCid <- submit operator do
+    exerciseCmd tokenCid AccrueYield
+
+  -- 4. Verify the new amount includes the accrued yield
+  updatedToken <- fromSome <$> queryContractId user updatedTokenCid
+  let expectedAmount = initialAmount * (1.0 + apr)
+  -- Use a tolerance for decimal precision comparisons
+  assert (abs (updatedToken.amount - expectedAmount) < 0.0000000001)
+
+  debug "testYieldAccrual finished successfully."
+
+-- Test the reserve attestation workflow.
+testReserveAttestation : Script ()
+testReserveAttestation = script do
+  debug "Running testReserveAttestation..."
+  TestSetup{..} <- setup 0.0
+
+  -- 1. Attestor creates a new reserve attestation
+  let attestationAmount = 10_000_000.0
+  attestationDate <- D.toDateUTC <$> getTime
+  attestationCid <- submit attestor do
+    createCmd Attestation with
+      attestor
+      issuer
+      attestationDate
+      reserveAmount = attestationAmount
+      currency = "USD"
+      detailsUrl = "https://example.com/attestation/2024-q1.pdf"
+
+  -- 2. Issuer accepts the attestation, making it public
+  publishedCid <- submit issuer do
+    exerciseCmd attestationCid Publish
+
+  -- 3. Verify the public attestation can be seen by the user (a public party)
+  publishedAttestation <- fromSome <$> queryContractId user publishedCid
+  publishedAttestation.attestation.reserveAmount === attestationAmount
+  publishedAttestation.attestation.issuer === issuer
+
+  debug "testReserveAttestation finished successfully."
+
+
+-- Main test entry point that runs all scenarios.
+stablecoinTests : Script ()
+stablecoinTests = do
+  testMintSuccess
+  testRedeemSuccess
+  testComplianceGateFailure
+  testYieldAccrual
+  testReserveAttestation
