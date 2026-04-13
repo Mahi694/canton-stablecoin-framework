@@ -1,0 +1,31 @@
+name: Canton Stablecoin Framework CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    name: Build & Test Daml Contracts
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install DPM (Daml Package Manager)
+        run: curl https://get.digitalasset.com/install/install.sh | sh
+
+      - name: Add DPM to PATH
+        run: echo "$HOME/.dpm/bin" >> $GITHUB_PATH
+
+      - name: Verify DPM installation
+        run: dpm --version
+
+      - name: Build Daml contracts
+        run: dpm build
+
+      - name: Run Daml tests
+        run: dpm test
