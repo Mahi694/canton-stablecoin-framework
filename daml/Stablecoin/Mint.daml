@@ -1,102 +1,97 @@
--- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
--- SPDX-License-Identifier: Apache-2.0
-
 module Stablecoin.Mint where
 
-import DA.Set (empty)
-import Stablecoin.Token (Token)
+import Daml.Finance.Interface.Asset.Fungible.Factory qualified as FungibleFactory (I, View(..), Create(..))
+import Daml.Finance.Interface.Asset.Fungible.Allocation qualified as Fungible (Allocation(..))
+import Daml.Finance.Interface.Asset.Fungible.Instrument qualified as FungibleInstrument (View)
+import Daml.Finance.Interface.Types.Common.Types (InstrumentKey)
 
--- | Represents a formal request from a 'tokenHolder' to the 'issuer' to mint a
--- | specified 'amount' of stablecoins of a given 'tokenType'.
--- | This request must be attested by a neutral 'auditor' who verifies the
--- | backing reserves before the minting can proceed.
-template MintRequest
+import DA.Time (addRelTime, relTime)
+import DA.Assert (assertMsg)
+import DA.Set (singleton)
+import qualified DA.Map as Map
+
+import Stablecoin.ReserveAttestation (ReserveAttestation(..))
+
+-- | Encapsulates the core minting logic for the stablecoin.
+-- It performs all necessary validation, including checking the freshness of reserve attestations,
+-- before creating new tokens and allocating them to a recipient.
+-- This helper function is designed to be called from different workflows (e.g., direct minting, request-based minting).
+--
+-- This function contains the primary logic update: it will fail if the provided
+-- `ReserveAttestation` contract is older than 24 hours from the current ledger time.
+checkAndMint :
+  Party -> ContractId FungibleFactory.I -> InstrumentKey -> Decimal -> Party -> ContractId ReserveAttestation -> Script (ContractId Fungible.Allocation)
+checkAndMint issuer tokenFactoryCid instrumentKey amountToMint recipient attestationCid = do
+  -- Step 1: Fetch dependent contracts from the ledger.
+  attestation <- fetch attestationCid
+
+  -- Step 2: Validate the attestation's relevance and authority.
+  assertMsg "Attestation instrument ID does not match the token's instrument key."
+    (attestation.instrumentId == instrumentKey)
+
+  assertMsg "Reserve attestation must be signed by the issuer of this token."
+    (attestation.issuer == issuer)
+
+  -- Step 3: Check freshness of the reserve attestation.
+  -- This is a critical control to prevent minting against stale reserve data.
+  -- The transaction is aborted if the attestation is older than 24 hours.
+  currentTime <- getTime
+  let maxAgeSeconds = 24.0 * 60.0 * 60.0 -- 24 hours
+  let attestationExpiry = addRelTime attestation.attestationTime (relTime maxAgeSeconds)
+
+  assertMsg "Reserve attestation is older than 24 hours and is considered stale. Minting is blocked."
+    (currentTime <= attestationExpiry)
+
+  -- Step 4: (Simplified) Check if minting would exceed attested reserves.
+  -- A production system would track total supply and check `currentTotalSupply + amountToMint <= reserveAmount`.
+  -- For this example, we check that the single mint operation is within the total reserve amount.
+  assertMsg "Minting this amount would exceed the total attested reserve amount."
+    (amountToMint <= attestation.reserveAmount)
+
+  -- Step 5: Mint the new tokens using the Daml Finance fungible factory.
+  -- The new tokens are contractually owned by the `issuer` (the controller of this script).
+  fungibleCid <- exercise tokenFactoryCid FungibleFactory.Create with
+    quantity = amountToMint
+    observers = Map.fromList [("default", singleton recipient)]
+
+  -- Step 6: Atomically allocate the newly minted tokens to the specified recipient.
+  -- The recipient can then call `Claim` on the resulting `Fungible.Allocation` contract
+  -- to take ownership of the tokens.
+  create Fungible.Allocation with
+    asset = fungibleCid
+    newOwner = recipient
+
+-- | Represents the issuer's operational role and capabilities for a specific stablecoin.
+-- An instance of this contract exists for each stablecoin the issuer manages.
+-- It serves as the entry point for authorized minting operations.
+template IssuerRole
   with
-    issuer : Party
-      -- ^ The entity responsible for issuing the stablecoin.
-    tokenHolder : Party
-      -- ^ The party requesting to receive the newly minted tokens.
-    auditor : Party
-      -- ^ An independent party responsible for verifying the reserves.
-    tokenType : Text
-      -- ^ The type of stablecoin to be minted (e.g., "EURC", "GBPC").
-    amount : Decimal
-      -- ^ The quantity of tokens to mint.
-    requestId : Text
-      -- ^ A unique identifier for the minting request for tracking and idempotency.
-  where
-    ensure amount > 0.0
-
-    signatory issuer, tokenHolder
-    observer auditor
-
-    key (issuer, tokenHolder, requestId) : (Party, Party, Text)
-    maintainer key._1
-
-    -- | The 'tokenHolder' can withdraw their mint request at any time before it has
-    -- | been attested by the auditor.
-    choice CancelMintRequest : ()
-      controller tokenHolder
-      do
-        archive self
-
-    -- | The 'auditor' exercises this choice to confirm that the corresponding fiat
-    -- | or commodity reserves have been received and are sufficient to back the
-    -- | requested mint amount.
-    choice AttestReserves : ContractId AttestedMintRequest
-      with
-        attestationProof : Text
-          -- ^ A reference to the proof of reserve (e.g., a bank transaction ID).
-      controller auditor
-      do
-        create AttestedMintRequest with
-          issuer
-          tokenHolder
-          auditor
-          tokenType
-          amount
-          requestId
-          attestationProof
-
--- | Represents a 'MintRequest' that has been successfully verified by the 'auditor'.
--- | This contract serves as the authorization for the 'issuer' to proceed with
--- | the final minting of the tokens.
-template AttestedMintRequest
-  with
-    issuer : Party
-      -- ^ The stablecoin issuer.
-    tokenHolder : Party
-      -- ^ The party who will receive the minted tokens.
-    auditor : Party
-      -- ^ The auditor who verified the reserves.
-    tokenType : Text
-      -- ^ The type of stablecoin.
-    amount : Decimal
-      -- ^ The quantity of tokens.
-    requestId : Text
-      -- ^ The original unique identifier for the request.
-    attestationProof : Text
-      -- ^ The proof of reserve provided by the auditor.
+    issuer          : Party                           -- ^ The legal entity issuing the stablecoin.
+    instrument      : FungibleInstrument.View         -- ^ The instrument definition of the stablecoin.
+    tokenFactoryCid : ContractId FungibleFactory.I    -- ^ The factory contract for minting this stablecoin.
   where
     signatory issuer
-    observer tokenHolder, auditor
 
-    key (issuer, tokenHolder, requestId) : (Party, Party, Text)
+    key (issuer, instrument) : (Party, FungibleInstrument.View)
     maintainer key._1
 
-    -- | The 'issuer' exercises this choice to create the stablecoin tokens and
-    -- | transfer them to the 'tokenHolder'. This is the final step in the
-    -- | minting workflow.
-    choice FinalizeMint : ContractId Token
+    -- | Allows the issuer to mint a specified amount of stablecoins and allocate them
+    -- to a recipient, provided a recent reserve attestation is supplied. This choice
+    -- enforces the rule that minting is only possible with fresh proof of reserves.
+    choice MintAndAllocate : ContractId Fungible.Allocation
+      with
+        amountToMint   : Decimal                      -- ^ The quantity of tokens to mint.
+        recipient      : Party                        -- ^ The party who will receive the newly minted tokens.
+        attestationCid : ContractId ReserveAttestation -- ^ A recent attestation of reserves, not older than 24h.
       controller issuer
       do
-        -- In a production system with high volume, one might fetch an existing
-        -- Token holding for the owner and credit it. For this reference
-        -- framework, creating a new, distinct Token contract is a clear and
-        -- robust pattern that simplifies fungibility management.
-        create Token with
-          issuer = issuer
-          owner = tokenHolder
-          tokenType = tokenType
-          quantity = amount
-          observers = empty
+        factoryView <- fetch tokenFactoryCid
+
+        -- Delegate to the common minting logic function which contains all validation rules.
+        checkAndMint
+          this.issuer
+          this.tokenFactoryCid
+          factoryView.id
+          amountToMint
+          recipient
+          attestationCid
